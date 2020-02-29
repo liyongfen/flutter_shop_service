@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <title>大文件上传</title>
+    <style type="text/css">
+        #progress {
+            height: 20px;
+            width: 300px;
+            margin-bottom: 30px;
+        }
+
+        #progress span {
+            display: block;
+            height: 20px;
+            width: 0;
+            color: #fff;
+            font-size: 12px;
+        }
+
+        .red {
+            background-color: red;
+        }
+
+        .green {
+            background-color: green;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>大文文件分片上传 之 xhr formdata </h1>
+    <div>
+        选择文件:
+        <input type="file" id="file" /><br /><br />
+        <div id="progress">
+            <span class="red"></span>
+        </div>
+        <button type="button" id="btn-submit">上 传</button>
+    </div>
+</body>
+
+</html>
+<script src="./js/MPromise.js"></script>
+<script src="./js/PromisePool.js"></script>
+<script>
+    //思路概括
+    //把大文件分成每2m 一块进行上传，发送到服务器同时携带一个标志 暂时用当前的时间戳 ，
+    //服务端生成临时文件，服务端接受一个文件结束的标志 ，然后将所有的文件进行合并成一个文件，清理临时文件。 返回结果（看情况）
+    const CHUNKSIZE = 1 * 1024 * 1024;//1M
+    const UPLOADURL = 'http://localhost:8100/upload';
+    const MERGEURL = 'http://localhost:8100/merge';
+    let progressSpan = document.getElementById('progress').firstElementChild;
+    let sendList = [];
+
+    let pool = new PromisePool(function (fileChunk, index) {
+        return xhrSend(fileChunk.formdata);
+    }, 2);
+    pool.retries = 3;
+
+    async function submitUpload() {
+        let file = document.getElementById('file').files[0];
+        if (!file) {
+            alert('请选择文件');
+            return;
+        }
+        resetData();
+
+        let token = (+ new Date()),
+            chunkCount = 0,
+            fileHash,
+            fileName = file.name;
+
+        fileChunkList = createFileChunk(file);//拆分文件
+        chunkCount = fileChunkList.length;
+        fileHash = await calculateHash(fileChunkList);
+
+        sendList = fileChunkList.map(({ chunk }, index) => ({
+            fileHash,
+            chunk,
+            hash: fileName + "-" + index, // 文件名 + 数组下标
+            percentage: 0
+        }));
+
+
+        pool.add(sendList);
+        pool.start(function(progress){
+            if (progress.success) {
+                console.log('task ' + progress.index + ' ' + progress.fulfilled + '/' + progress.total, ' ', progress.success);
+            } else {
+                //5 retries left   还剩5次重试机会
+                console.log('task ' + progress.index + ' failed with ' + progress.error + ', ' + progress.retries + ' retries left.');
+            }
+        }).then(function (result) {
+            if (result.fulfilled === chunkCount) {
+                console.log('切片上传完成，发送合并请求');
+                xhrMerge(`?token=${token}&chunkCount=${chunkCount}&filename=${fileName}`).then((res)=>{
+                    console.log(res);
+                }).catch((error)=>{
+                    console.log(error);
+                });
+            } else {
+                console.log('上传失败：', result);
+            }
+        });
+    }
+    function xhrMerge(params) {
+        return new Promise((resolve, reject) => {
+            let xhr = new XMLHttpRequest();   //创建对象
+            
+            xhr.addEventListener("error", function (e) {//失
+                reject(xhr.responseText);
+            });
+
+            xhr.addEventListener("load", function (e) {
+                var res = e.target.responseText;
+                try {
+                    res = JSON.parse(res);
+                } catch (err) { }
+                if (res && res.status === 1) {//成功
+                    resolve('上传成功');
+                } else {
+                    reject('上传失败');
+                }
+            });
+            
+            xhr.open('GET', MERGEURL + params, true);
+            //注意 send 一定要写在最下面，否则 onprogress 只会执行最后一次 也就是100%的时候
+            xhr.send(null);//发送时  Content-Type默认就是: multipart/form-data; 
+        });
+    }
+    function xhrSend(fd) {
+        return new Promise((resolve, reject)=>{
+            let xhr = new XMLHttpRequest();   //创建对象
+            let index = fd.get('index');
+
+            xhr.addEventListener("error", function (e) {//失
+                reject(xhr.responseText);
+            });
+            xhr.upload.addEventListener("progress", function (e) {
+                //console.log(event);
+                if (event.lengthComputable) {
+                    //let percent = (event.loaded / event.total * 100).toFixed(2);
+                    let completedPercent = uploadPercentage(event.loaded, index);
+                    setProgress(completedPercent);
+                }
+            });
+            xhr.addEventListener("load", function (e) {
+                var res = e.target.responseText;
+                try {
+                    res = JSON.parse(res);
+                } catch (err) { }
+                if (res && res.status === 1) {//成功
+                    resolve('成功');
+                } else {
+                    reject('切片上传失败');
+                }
+            });
+            xhr.open('POST', UPLOADURL, true);
+            //注意 send 一定要写在最下面，否则 onprogress 只会执行最后一次 也就是100%的时候
+            xhr.send(fd);//发送时  Content-Type默认就是: multipart/form-data; 
+        });
+    }
+    // 生成文件切片
+    function createFileChunk(file, size = CHUNKSIZE) {
+        const fileChunkList = [];
+        let cur = 0;
+        while (cur < file.size) {
+            fileChunkList.push({ chunk: file.slice(cur, cur + size) });
+            cur += size;
+        }
+        return fileChunkList;
+    }
+    function createFileChunk2(file, token, size = CHUNKSIZE) {
+        const fileSize = file.size;
+        let fileChunkList = [];
+        let cur = 0;
+        let index = 0;
+
+        while (cur < fileSize) {
+            let blob = file.slice(cur, cur + size);
+            let fd = new FormData();   //构造FormData对象
+            fd.append('token', token);
+            fd.append('blob', blob);
+            fd.append('index', index);
+
+            fileChunkList.push({ 
+                chunk: blob,
+                loaded: 0,
+                index: index,
+                size: blob.size,
+                totalSize: fileSize,
+                formdata: fd,
+            });
+            index++;
+            cur += size;
+        }
+
+        return fileChunkList;
+    }
+    function uploadPercentage(loaded, index) {
+        fileChunkList.map((item, i) => {
+            if(i == index){
+                item.loaded = loaded;
+            } 
+            return item;
+        });
+        return 
+    }
+    function resetData() {
+        fileChunkList = [];
+        progressSpan.style.width = '0';
+        progressSpan.classList.remove('green');
+    }
+    function setProgress(){
+        const loaded = fileChunkList.reduce((acc, item) => acc + item.loaded);
+        const completedPercent = parseInt((loaded / fileChunkList[0].totalSize).toFixed(2));
+
+        progressSpan.style.width = completedPercent + '%';
+        progressSpan.innerHTML = completedPercent + '%';
+        if (completedPercent > 90) {//进度条变色
+            progressSpan.classList.add('green');
+        }
+        console.log('已上传', completedPercent);
+    }
+    
+    function  calculateHash(fileChunkList) {
+        return new Promise(resolve => {
+            //添加 worker 属性
+            let worker = new Worker("./js/hash.js");
+            worker.postMessage({ fileChunkList });
+            worker.onmessage = e => {
+                const { percentage, hash } = e.data;
+                this.hashPercentage = percentage;
+                if (hash) {
+                    resolve(hash);
+                } else {
+                    reject('计算文件hash失败')
+                }
+            };
+        });
+    }
+            
+    //绑定提交事件
+    document.getElementById('btn-submit').addEventListener('click', submitUpload);
+
+</script>
